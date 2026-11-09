@@ -1,0 +1,23 @@
+{
+  "repository": {
+    "intent": {
+      "entries": [
+        {
+          "kind": "tool",
+          "name": "dotnet",
+          "order": 1,
+          "isEnabled": true,
+          "includePreRelease": false,
+          "versionScope": "10.*"
+        },
+        {
+          "kind": "tool",
+          "name": "docker-cli",
+          "order": 2,
+          "isEnabled": true,
+          "includePreRelease": false
+        }
+      ]
+    }
+  }
+}
