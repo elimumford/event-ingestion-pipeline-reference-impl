@@ -11,4 +11,4 @@ public sealed record InventoryDeltaAdjusted(
     string UnitTypeId,
     IReadOnlyList<NightlyInventoryAdjustment> Adjustments,
     DateTimeOffset Timestamp
-);
+) : IInventoryEvent;

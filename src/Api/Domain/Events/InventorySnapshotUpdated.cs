@@ -8,4 +8,4 @@ public sealed record InventorySnapshotUpdated(
     string UnitTypeId,
     IReadOnlyList<NightlyInventory> Counts,
     DateTimeOffset Timestamp
-);
+) : IInventoryEvent;
