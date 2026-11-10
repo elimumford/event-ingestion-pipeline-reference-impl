@@ -37,6 +37,9 @@ public static class ServiceCollectionExtensions
     // 3. Register SQS publisher under the key
     services.AddKeyedSingleton<IEventPublisher, SqsEventPublisher>("sqs-publisher");
 
+    // 4. Add custom resilience pipelines
+    services.AddCustomResiliencePipelines();
+
     return services;
   }
 }
