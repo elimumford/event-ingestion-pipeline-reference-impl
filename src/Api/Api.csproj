@@ -8,6 +8,9 @@
 
   <ItemGroup>
     <PackageReference Include="AWSSDK.SQS" Version="4.0.100.25" />
+    <PackageReference Include="Microsoft.Extensions.Resilience" Version="10.11.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.20.1" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.20.1" />
   </ItemGroup>
 
 </Project>
