@@ -74,12 +74,31 @@ function Start-DockerTunnel {
 }
 
 function Start-DockerServices {
-    Write-Host '[Compose] Starting ElasticMQ on remote daemon via Compose...' -ForegroundColor Cyan
-    docker compose up -d sqs
-    if ($LASTEXITCODE -ne 0) {
-        throw '[Compose] Failed to start services via docker compose.'
+    Write-Host '[Docker] Checking ElasticMQ container on remote daemon...' -ForegroundColor Cyan
+
+    $running = docker ps -q --filter 'name=sqs-emulator'
+    if (-not $running) {
+        $exists = docker ps -aq --filter 'name=sqs-emulator'
+        if ($exists) {
+            Write-Host '[Docker] Starting existing sqs-emulator container...' -ForegroundColor Cyan
+            docker start sqs-emulator | Out-Null
+        } else {
+            Write-Host '[Docker] Running new sqs-emulator container...' -ForegroundColor Cyan
+            docker run -d `
+                --name sqs-emulator `
+                -p 9324:9324 `
+                -p 9325:9325 `
+                --restart unless-stopped `
+                -e ELASTICMQ_NODE_ADDRESS_PORT=9324 `
+                -e ELASTICMQ_NODE_ADDRESS_HOST=localhost `
+                softwaremill/elasticmq-native:latest | Out-Null
+        }
     }
-    Write-Host '[Compose] ElasticMQ service running.' -ForegroundColor Green
+
+    if ($LASTEXITCODE -ne 0) {
+        throw '[Docker] Failed to start ElasticMQ container.'
+    }
+    Write-Host '[Docker] ElasticMQ service running.' -ForegroundColor Green
 }
 
 function Start-SqsTunnel {
@@ -162,8 +181,8 @@ if ($StatusOnly) {
 }
 
 if ($Stop) {
-    Write-Host '[Teardown] Stopping Docker Compose services...' -ForegroundColor Cyan
-    docker compose down 2>$null
+    Write-Host '[Teardown] Stopping Docker services...' -ForegroundColor Cyan
+    docker stop sqs-emulator 2>$null
     Stop-TunnelByPort -Port $SqsPort -Label 'SQS'
     Stop-TunnelByPort -Port $DockerPort -Label 'Docker'
     exit 0
