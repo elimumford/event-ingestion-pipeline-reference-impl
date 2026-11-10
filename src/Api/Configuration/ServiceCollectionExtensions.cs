@@ -1,7 +1,11 @@
 namespace Api.Configuration;
 
+using System.Threading.Channels;
 using Amazon.SQS;
 using Api.Infrastructure;
+using Api.Infrastructure.Queue;
+using Api.Workers;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
@@ -14,6 +18,7 @@ public static class ServiceCollectionExtensions
 
     // 1. Bind Options
     services.Configure<SqsOptions>(configuration.GetSection(SqsOptions.SectionName));
+    services.Configure<ChannelOptions>(configuration.GetSection(ChannelOptions.SectionName));
 
     // 2. Register IAmazonSQS
     services.AddSingleton<IAmazonSQS>(sp =>
@@ -39,6 +44,28 @@ public static class ServiceCollectionExtensions
 
     // 4. Add custom resilience pipelines
     services.AddCustomResiliencePipelines();
+
+    // 5. Register Bounded Channel and separate Reader / Writer endpoints
+    services.AddSingleton<Channel<InventoryEventEnvelope>>(sp =>
+    {
+      var options = sp.GetRequiredService<IOptions<ChannelOptions>>().Value;
+      return Channel.CreateBounded<InventoryEventEnvelope>(new BoundedChannelOptions(options.Capacity)
+      {
+        FullMode = BoundedChannelFullMode.Wait,
+        SingleReader = false,
+        SingleWriter = true
+      });
+    });
+
+    services.AddSingleton<ChannelReader<InventoryEventEnvelope>>(sp =>
+        sp.GetRequiredService<Channel<InventoryEventEnvelope>>().Reader);
+
+    services.AddSingleton<ChannelWriter<InventoryEventEnvelope>>(sp =>
+        sp.GetRequiredService<Channel<InventoryEventEnvelope>>().Writer);
+
+    // 6. Register Hosted Services
+    services.AddHostedService<EventProcessorWorker>();
+    services.AddHostedService<SqsConsumerWorker>();
 
     return services;
   }
