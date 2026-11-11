@@ -95,7 +95,7 @@ public sealed class EventProcessorWorker(
     }
   }
 
-  private static async Task HandleSnapshotAsync(
+  internal static async Task HandleSnapshotAsync(
       InventoryDbContext dbContext,
       InventorySnapshotUpdated snapshot,
       CancellationToken cancellationToken)
@@ -127,7 +127,7 @@ public sealed class EventProcessorWorker(
     }
   }
 
-  private static async Task HandleDeltaAsync(
+  internal static async Task HandleDeltaAsync(
       InventoryDbContext dbContext,
       InventoryDeltaAdjusted delta,
       CancellationToken cancellationToken)

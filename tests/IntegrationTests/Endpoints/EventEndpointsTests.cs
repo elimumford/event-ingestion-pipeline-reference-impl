@@ -51,4 +51,44 @@ public class EventEndpointsTests(TestApiApplication factory) : IClassFixture<Tes
     // Assert
     Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
   }
+
+  [Fact]
+  public async Task IngestDelta_ValidPayload_ReturnsAcceptedAndPublishes()
+  {
+    // Arrange
+    var payload = new InventoryDeltaAdjusted(
+        EventId: Guid.NewGuid().ToString(),
+        PropertyId: "prop-slc-01",
+        UnitTypeId: "unit-deluxe-queen",
+        Adjustments: [new NightlyInventoryAdjustment(new DateOnly(2026, 11, 10), -2)],
+        Timestamp: DateTimeOffset.UtcNow
+    );
+
+    // Act
+    var response = await _client.PostAsJsonAsync("/api/v1/inventory/delta", payload);
+
+    // Assert
+    Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+    Assert.Null(response.Headers.Location);
+    Assert.Contains(_publisher.PublishedEvents, e => e.EventId == payload.EventId);
+  }
+
+  [Fact]
+  public async Task IngestDelta_EmptyAdjustments_ReturnsBadRequest()
+  {
+    // Arrange
+    var invalidPayload = new InventoryDeltaAdjusted(
+        EventId: Guid.NewGuid().ToString(),
+        PropertyId: "prop-slc-01",
+        UnitTypeId: "unit-deluxe-queen",
+        Adjustments: [],
+        Timestamp: DateTimeOffset.UtcNow
+    );
+
+    // Act
+    var response = await _client.PostAsJsonAsync("/api/v1/inventory/delta", invalidPayload);
+
+    // Assert
+    Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+  }
 }
