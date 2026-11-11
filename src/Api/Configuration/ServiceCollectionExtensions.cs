@@ -3,8 +3,10 @@ namespace Api.Configuration;
 using System.Threading.Channels;
 using Amazon.SQS;
 using Api.Infrastructure;
+using Api.Infrastructure.Persistence;
 using Api.Infrastructure.Queue;
 using Api.Workers;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -66,6 +68,15 @@ public static class ServiceCollectionExtensions
     // 6. Register Hosted Services
     services.AddHostedService<EventProcessorWorker>();
     services.AddHostedService<SqsConsumerWorker>();
+
+    // 7. Register InventoryDbContext with connection string from configuration
+    var connectionString = configuration.GetConnectionString("DefaultConnection")
+    ?? throw new InvalidOperationException("Connection string 'DefaultConnection' was not found.");
+
+    services.AddDbContext<InventoryDbContext>(options =>
+    {
+      options.UseNpgsql(connectionString);
+    });
 
     return services;
   }

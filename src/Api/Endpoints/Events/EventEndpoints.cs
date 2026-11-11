@@ -10,8 +10,8 @@ public static class EventEndpoints
 {
   public static RouteGroupBuilder MapEventEndpoints(this IEndpointRouteBuilder app)
   {
-    var group = app.MapGroup("/api/v1/events")
-                   .WithTags("Events");
+    var group = app.MapGroup("/api/v1/inventory")
+                   .WithTags("Inventory");
 
     group.MapPost("/snapshot", HandleSnapshotAsync)
          .WithName("IngestSnapshot")
@@ -30,7 +30,7 @@ public static class EventEndpoints
       CancellationToken ct)
   {
     await publisher.PublishAsync(payload, ct);
-    return TypedResults.Accepted($"/api/v1/events/status/{payload.EventId}");
+    return TypedResults.Accepted((string?)null);
   }
 
   private static async Task<Results<Accepted, ValidationProblem>> HandleDeltaAsync(
@@ -39,6 +39,6 @@ public static class EventEndpoints
       CancellationToken ct)
   {
     await publisher.PublishAsync(payload, ct);
-    return TypedResults.Accepted($"/api/v1/events/status/{payload.EventId}");
+    return TypedResults.Accepted((string?)null);
   }
 }

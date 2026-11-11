@@ -6,9 +6,13 @@ using System.Threading.Channels;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using Api.Configuration;
+using Api.Domain.Entities;
 using Api.Domain.Events;
 using Api.Infrastructure;
+using Api.Infrastructure.Persistence;
 using Api.Infrastructure.Queue;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -17,6 +21,7 @@ public sealed class EventProcessorWorker(
     ChannelReader<InventoryEventEnvelope> channelReader,
     IAmazonSQS sqsClient,
     IOptions<SqsOptions> sqsOptions,
+    IServiceScopeFactory scopeFactory,
     ILogger<EventProcessorWorker> logger) : BackgroundService
 {
   private readonly SqsOptions _sqsOptions = sqsOptions.Value;
@@ -35,7 +40,6 @@ public sealed class EventProcessorWorker(
 
   private async Task ProcessEnvelopeAsync(InventoryEventEnvelope envelope, CancellationToken cancellationToken)
   {
-    // Rehydrate distributed trace context and link span
     using var activity = Diagnostics.ActivitySource.StartActivity(
         "inventory.process",
         ActivityKind.Consumer,
@@ -48,34 +52,37 @@ public sealed class EventProcessorWorker(
 
     try
     {
-      switch (envelope.EventType)
+      using (var scope = scopeFactory.CreateScope())
       {
-        case nameof(InventorySnapshotUpdated):
-          var snapshot = JsonSerializer.Deserialize<InventorySnapshotUpdated>(envelope.Body);
-          logger.LogInformation(
-              "Processed snapshot for property {PropertyId}, unit {UnitTypeId} ({Count} dates).",
-              snapshot?.PropertyId,
-              snapshot?.UnitTypeId,
-              snapshot?.Counts.Count
-          );
-          break;
+        var dbContext = scope.ServiceProvider.GetRequiredService<InventoryDbContext>();
 
-        case nameof(InventoryDeltaAdjusted):
-          var delta = JsonSerializer.Deserialize<InventoryDeltaAdjusted>(envelope.Body);
-          logger.LogInformation(
-              "Processed delta adjustment for property {PropertyId}, unit {UnitTypeId}, Delta: {Delta}.",
-              delta?.PropertyId,
-              delta?.UnitTypeId,
-              delta?.Adjustments.Count
-          );
-          break;
+        switch (envelope.EventType)
+        {
+          case nameof(InventorySnapshotUpdated):
+            var snapshot = JsonSerializer.Deserialize<InventorySnapshotUpdated>(envelope.Body);
+            if (snapshot is not null)
+            {
+              await HandleSnapshotAsync(dbContext, snapshot, cancellationToken);
+            }
+            break;
 
-        default:
-          logger.LogWarning("Unrecognized event type {EventType}. Skipping dispatch.", envelope.EventType);
-          break;
+          case nameof(InventoryDeltaAdjusted):
+            var delta = JsonSerializer.Deserialize<InventoryDeltaAdjusted>(envelope.Body);
+            if (delta is not null)
+            {
+              await HandleDeltaAsync(dbContext, delta, cancellationToken);
+            }
+            break;
+
+          default:
+            logger.LogWarning("Unrecognized event type {EventType}. Skipping dispatch.", envelope.EventType);
+            break;
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
       }
 
-      // Acknowledge and remove from queue
+      // Acknowledge and delete message only after persistence commits
       await sqsClient.DeleteMessageAsync(new DeleteMessageRequest
       {
         QueueUrl = _sqsOptions.QueueUrl,
@@ -85,6 +92,77 @@ public sealed class EventProcessorWorker(
     catch (Exception ex)
     {
       logger.LogError(ex, "Failed to process message {MessageId}. Leaving on queue for redelivery.", envelope.MessageId);
+    }
+  }
+
+  private static async Task HandleSnapshotAsync(
+      InventoryDbContext dbContext,
+      InventorySnapshotUpdated snapshot,
+      CancellationToken cancellationToken)
+  {
+    var dates = snapshot.Counts.Select(c => c.Date).ToArray();
+
+    var existingItems = await dbContext.InventoryItems
+        .Where(i => i.PropertyId == snapshot.PropertyId &&
+                    i.UnitTypeId == snapshot.UnitTypeId &&
+                    dates.Contains(i.Date))
+        .ToDictionaryAsync(i => i.Date, cancellationToken);
+
+    foreach (var count in snapshot.Counts)
+    {
+      if (existingItems.TryGetValue(count.Date, out var existing))
+      {
+        existing.AvailableInventory = count.AvailableInventory;
+      }
+      else
+      {
+        dbContext.InventoryItems.Add(new InventoryItem
+        {
+          PropertyId = snapshot.PropertyId,
+          UnitTypeId = snapshot.UnitTypeId,
+          Date = count.Date,
+          AvailableInventory = count.AvailableInventory
+        });
+      }
+    }
+  }
+
+  private static async Task HandleDeltaAsync(
+      InventoryDbContext dbContext,
+      InventoryDeltaAdjusted delta,
+      CancellationToken cancellationToken)
+  {
+    var dates = delta.Adjustments.Select(a => a.Date).ToArray();
+
+    var existingItems = await dbContext.InventoryItems
+        .Where(i => i.PropertyId == delta.PropertyId &&
+                    i.UnitTypeId == delta.UnitTypeId &&
+                    dates.Contains(i.Date))
+        .ToDictionaryAsync(i => i.Date, cancellationToken);
+
+    foreach (var adjustment in delta.Adjustments)
+    {
+      if (existingItems.TryGetValue(adjustment.Date, out var existing))
+      {
+        // Apply relative adjustment to existing baseline
+        existing.AvailableInventory += adjustment.AvailableInventoryAdjustment;
+
+        // Ensure inventory does not go below zero
+        if (existing.AvailableInventory < 0)
+        {
+          existing.AvailableInventory = 0;
+        }
+      }
+      else
+      {
+        dbContext.InventoryItems.Add(new InventoryItem
+        {
+          PropertyId = delta.PropertyId,
+          UnitTypeId = delta.UnitTypeId,
+          Date = adjustment.Date,
+          AvailableInventory = Math.Max(0, adjustment.AvailableInventoryAdjustment)
+        });
+      }
     }
   }
 }

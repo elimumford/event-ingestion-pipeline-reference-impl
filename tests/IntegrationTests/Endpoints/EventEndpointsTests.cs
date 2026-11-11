@@ -25,11 +25,11 @@ public class EventEndpointsTests(TestApiApplication factory) : IClassFixture<Tes
     );
 
     // Act
-    var response = await _client.PostAsJsonAsync("/api/v1/events/snapshot", payload);
+    var response = await _client.PostAsJsonAsync("/api/v1/inventory/snapshot", payload);
 
     // Assert
     Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-    Assert.NotNull(response.Headers.Location);
+    Assert.Null(response.Headers.Location);
     Assert.Contains(_publisher.PublishedEvents, e => e.EventId == payload.EventId);
   }
 
@@ -46,7 +46,7 @@ public class EventEndpointsTests(TestApiApplication factory) : IClassFixture<Tes
     );
 
     // Act
-    var response = await _client.PostAsJsonAsync("/api/v1/events/snapshot", invalidPayload);
+    var response = await _client.PostAsJsonAsync("/api/v1/inventory/snapshot", invalidPayload);
 
     // Assert
     Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
