@@ -1,10 +1,10 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Start')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(ParameterSetName = 'Start', Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$RemoteUser,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(ParameterSetName = 'Start', Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$RemoteAddress,
 
@@ -23,7 +23,10 @@ param(
     [ValidateRange(1, 65535)]
     [int]$PostgresPort = 5432,
 
+    [Parameter(ParameterSetName = 'Stop', Mandatory = $true)]
     [switch]$Stop,
+
+    [Parameter(ParameterSetName = 'Status', Mandatory = $true)]
     [switch]$StatusOnly
 )
 
