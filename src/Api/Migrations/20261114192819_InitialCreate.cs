@@ -1,9 +1,10 @@
 ﻿using System;
+using System.Collections.Generic;
 using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
 
-namespace Api.Infrastructure.Persistence.Migrations
+namespace Api.Migrations
 {
     /// <inheritdoc />
     public partial class InitialCreate : Migration
@@ -19,6 +20,8 @@ namespace Api.Infrastructure.Persistence.Migrations
                     UnitTypeId = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: false),
                     Date = table.Column<DateOnly>(type: "date", nullable: false),
                     AvailableInventory = table.Column<int>(type: "integer", nullable: false),
+                    LastSnapshotUtc = table.Column<DateTimeOffset>(type: "timestamp with time zone", nullable: false),
+                    RecentEventIds = table.Column<List<string>>(type: "text[]", nullable: false),
                     CreatedAtUtc = table.Column<DateTimeOffset>(type: "timestamp with time zone", nullable: false),
                     LastUpdatedUtc = table.Column<DateTimeOffset>(type: "timestamp with time zone", nullable: false)
                 },

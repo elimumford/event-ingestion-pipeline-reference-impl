@@ -18,9 +18,6 @@ param(
     [int]$SqsPort = 9324,
 
     [ValidateRange(1, 65535)]
-    [int]$SqsUiPort = 9325,
-
-    [ValidateRange(1, 65535)]
     [int]$PostgresPort = 5432,
 
     [Parameter(ParameterSetName = 'Stop', Mandatory = $true)]
@@ -36,7 +33,11 @@ $env:DOCKER_HOST = "tcp://$($LocalAddress):$($DockerPort)"
 $env:TESTCONTAINERS_HOST_OVERRIDE = $RemoteAddress
 $env:TESTCONTAINERS_RYUK_DISABLED = 'true'
 
-# --- Tunnel Primitives ---
+# 2.  Define project-scoped remote paths on the Linux container rig
+$projectName = 'event-ingestion-pipeline'
+$remoteProjectDir = "/home/$RemoteUser/projects/$projectName/docker/elasticmq"
+$remoteElasticMqConfigFile = "$remoteProjectDir/elasticmq.conf"
+$localElasticMqConfigFile = Join-Path $PSScriptRoot 'docker/elasticmq/elasticmq.conf'
 
 function Test-PortListening {
     param([int]$Port)
@@ -88,14 +89,31 @@ function Start-DockerServices {
         if ($sqsExists) {
             docker start sqs-emulator | Out-Null
         } else {
-            docker run -d `
-                --name sqs-emulator `
-                -p 9324:9324 `
-                -p 9325:9325 `
-                --restart unless-stopped `
-                -e ELASTICMQ_NODE_ADDRESS_PORT=9324 `
-                -e ELASTICMQ_NODE_ADDRESS_HOST=localhost `
-                softwaremill/elasticmq-native:latest | Out-Null
+            if (Test-Path $localElasticMqConfigFile) {
+                Write-Host '[Infrastructure] Syncing ElasticMQ configuration to remote host...' -ForegroundColor Cyan
+
+                # Ensure remote directory structure exists
+                ssh -q "${RemoteUser}@${RemoteAddress}" "mkdir -p '$remoteProjectDir'"
+
+                # Sync local declarative config up to the Linux Mint host
+                scp -q "$localElasticMqConfigFile" "${RemoteUser}@${RemoteAddress}:${remoteElasticMqConfigFile}"
+
+                # Ensure container runs with declarative volume mount
+                $containerCheck = ssh -q "${RemoteUser}@${RemoteAddress}" "docker inspect -f '{{.State.Running}}' elasticmq 2>/dev/null"
+                if ($containerCheck -ne 'true') {
+                    Write-Host '[Infrastructure] Starting ElasticMQ container with mounted topology...' -ForegroundColor Cyan
+
+                    docker run -d `
+                        --name elasticmq `
+                        --restart unless-stopped `
+                        -p 9324:9324 `
+                        -v ${remoteElasticMqConfigFile}:/opt/elasticmq.conf `
+                        softwaremill/elasticmq-native
+
+                }
+            } else {
+                Write-Warning "[Infrastructure] Local config not found at $localElasticMqConfigFile. Skipping config sync."
+            }
         }
     }
 
@@ -124,20 +142,24 @@ function Start-DockerServices {
     Write-Host '[Docker] Remote containers running.' -ForegroundColor Green
 }
 
+function Stop-DockerServices {
+    docker stop sqs-emulator postgres-dev 2>$null
+    docker rm sqs-emulator postgres-dev 2>$null
+}
+
 function Start-SqsTunnel {
     if (-not (Test-PortListening -Port $SqsPort)) {
         Write-Host '[SQS] Establishing SQS port tunnel over SSH...' -ForegroundColor Cyan
         $args = @(
             '-N',
             '-L', "$($LocalAddress):$($SqsPort):127.0.0.1:9324",
-            '-L', "$($LocalAddress):$($SqsUiPort):127.0.0.1:9325",
             "$RemoteUser@$RemoteAddress"
         )
         Start-Process ssh -ArgumentList $args -WindowStyle Hidden
         Start-Sleep -Seconds 2
 
         if (Test-PortListening -Port $SqsPort) {
-            Write-Host "[SQS] Tunnels online (API: $SqsPort, UI: $SqsUiPort)." -ForegroundColor Green
+            Write-Host "[SQS] Tunnels online (API: $SqsPort)." -ForegroundColor Green
         } else {
             throw "[SQS] Failed to establish SQS tunnel on port $SqsPort."
         }
@@ -164,30 +186,6 @@ function Start-PostgresTunnel {
         }
     } else {
         Write-Host "[Postgres] Active Postgres tunnel detected on port $PostgresPort." -ForegroundColor Green
-    }
-}
-
-function Initialize-SqsQueue {
-    param([string]$QueueName = 'inventory-events')
-    Write-Host "[SQS] Verifying '$QueueName' queue on localhost:$SqsPort..." -ForegroundColor Cyan
-
-    $maxRetries = 5
-    $retry = 0
-    $ready = $false
-
-    while (-not $ready -and $retry -lt $maxRetries) {
-        try {
-            $null = Invoke-RestMethod -Uri "http://${LocalAddress}:${SqsPort}?Action=CreateQueue&QueueName=$QueueName&Version=2012-11-05" -Method Post -ErrorAction Stop
-            $ready = $true
-            Write-Host "[SQS] Queue ready at http://${LocalAddress}:${SqsPort}/000000000000/$QueueName" -ForegroundColor Green
-        } catch {
-            $retry++
-            Start-Sleep -Milliseconds 500
-        }
-    }
-
-    if (-not $ready) {
-        Write-Warning "[SQS] Timed out waiting for ElasticMQ at http://${LocalAddress}:${SqsPort}."
     }
 }
 
@@ -236,7 +234,7 @@ if ($StatusOnly) {
 
 if ($Stop) {
     Write-Host '[Teardown] Stopping containers...' -ForegroundColor Cyan
-    docker stop sqs-emulator postgres-dev 2>$null
+    Stop-DockerServices
     Stop-TunnelByPort -Port $PostgresPort -Label 'Postgres'
     Stop-TunnelByPort -Port $SqsPort -Label 'SQS'
     Stop-TunnelByPort -Port $DockerPort -Label 'Docker'
@@ -248,7 +246,6 @@ try {
     Start-DockerServices
     Start-SqsTunnel
     Start-PostgresTunnel
-    Initialize-SqsQueue -QueueName 'inventory-events'
 
     code .
 } catch {

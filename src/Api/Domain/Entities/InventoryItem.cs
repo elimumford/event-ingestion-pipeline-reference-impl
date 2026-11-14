@@ -9,7 +9,12 @@ public sealed class InventoryItem : IAuditable
   public required DateOnly Date { get; set; }
   public int AvailableInventory { get; set; }
 
+  public DateTimeOffset LastSnapshotUtc { get; set; }
+
+  public List<string> RecentEventIds { get; set; } = [];
+
   // IAuditable implementation
   public DateTimeOffset CreatedAtUtc { get; set; }
   public DateTimeOffset LastUpdatedUtc { get; set; }
+
 }

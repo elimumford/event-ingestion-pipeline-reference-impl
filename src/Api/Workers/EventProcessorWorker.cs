@@ -62,7 +62,7 @@ public sealed class EventProcessorWorker(
             var snapshot = JsonSerializer.Deserialize<InventorySnapshotUpdated>(envelope.Body);
             if (snapshot is not null)
             {
-              await HandleSnapshotAsync(dbContext, snapshot, cancellationToken);
+              await HandleSnapshotAsync(dbContext, snapshot, logger, cancellationToken);
             }
             break;
 
@@ -70,7 +70,7 @@ public sealed class EventProcessorWorker(
             var delta = JsonSerializer.Deserialize<InventoryDeltaAdjusted>(envelope.Body);
             if (delta is not null)
             {
-              await HandleDeltaAsync(dbContext, delta, cancellationToken);
+              await HandleDeltaAsync(dbContext, delta, logger, cancellationToken);
             }
             break;
 
@@ -96,73 +96,107 @@ public sealed class EventProcessorWorker(
   }
 
   internal static async Task HandleSnapshotAsync(
-      InventoryDbContext dbContext,
-      InventorySnapshotUpdated snapshot,
-      CancellationToken cancellationToken)
+      InventoryDbContext db,
+      InventorySnapshotUpdated payload,
+      ILogger? logger = null,
+      CancellationToken ct = default)
   {
-    var dates = snapshot.Counts.Select(c => c.Date).ToArray();
-
-    var existingItems = await dbContext.InventoryItems
-        .Where(i => i.PropertyId == snapshot.PropertyId &&
-                    i.UnitTypeId == snapshot.UnitTypeId &&
-                    dates.Contains(i.Date))
-        .ToDictionaryAsync(i => i.Date, cancellationToken);
-
-    foreach (var count in snapshot.Counts)
+    foreach (var count in payload.Counts)
     {
-      if (existingItems.TryGetValue(count.Date, out var existing))
+      var existing = await db.InventoryItems
+          .FirstOrDefaultAsync(x =>
+              x.PropertyId == payload.PropertyId &&
+              x.UnitTypeId == payload.UnitTypeId &&
+              x.Date == count.Date, ct);
+
+      if (existing is null)
       {
-        existing.AvailableInventory = count.AvailableInventory;
+        db.InventoryItems.Add(new InventoryItem
+        {
+          PropertyId = payload.PropertyId,
+          UnitTypeId = payload.UnitTypeId,
+          Date = count.Date,
+          AvailableInventory = count.AvailableInventory,
+          LastSnapshotUtc = payload.Timestamp,
+          RecentEventIds = [payload.EventId]
+        });
       }
       else
       {
-        dbContext.InventoryItems.Add(new InventoryItem
+        // Drop stale snapshots that arrived out of order
+        if (payload.Timestamp < existing.LastSnapshotUtc)
         {
-          PropertyId = snapshot.PropertyId,
-          UnitTypeId = snapshot.UnitTypeId,
-          Date = count.Date,
-          AvailableInventory = count.AvailableInventory
-        });
+          logger?.LogWarning(
+              "Stale snapshot {EventId} for {Date} ignored. Snapshot timestamp {Timestamp} predates baseline {Baseline}",
+              payload.EventId, count.Date, payload.Timestamp, existing.LastSnapshotUtc);
+          continue;
+        }
+
+        existing.AvailableInventory = count.AvailableInventory;
+        existing.LastSnapshotUtc = payload.Timestamp;
+        // Snapshot establishes a new baseline; reset buffer to start clean from this event
+        existing.RecentEventIds = [payload.EventId];
       }
     }
+
+    await db.SaveChangesAsync(ct);
   }
 
   internal static async Task HandleDeltaAsync(
-      InventoryDbContext dbContext,
-      InventoryDeltaAdjusted delta,
-      CancellationToken cancellationToken)
+      InventoryDbContext db,
+      InventoryDeltaAdjusted payload,
+      ILogger? logger = null,
+      CancellationToken ct = default)
   {
-    var dates = delta.Adjustments.Select(a => a.Date).ToArray();
-
-    var existingItems = await dbContext.InventoryItems
-        .Where(i => i.PropertyId == delta.PropertyId &&
-                    i.UnitTypeId == delta.UnitTypeId &&
-                    dates.Contains(i.Date))
-        .ToDictionaryAsync(i => i.Date, cancellationToken);
-
-    foreach (var adjustment in delta.Adjustments)
+    foreach (var adj in payload.Adjustments)
     {
-      if (existingItems.TryGetValue(adjustment.Date, out var existing))
-      {
-        // Apply relative adjustment to existing baseline
-        existing.AvailableInventory += adjustment.AvailableInventoryAdjustment;
+      var existing = await db.InventoryItems
+          .FirstOrDefaultAsync(x =>
+              x.PropertyId == payload.PropertyId &&
+              x.UnitTypeId == payload.UnitTypeId &&
+              x.Date == adj.Date, ct);
 
-        // Ensure inventory does not go below zero
-        if (existing.AvailableInventory < 0)
-        {
-          existing.AvailableInventory = 0;
-        }
-      }
-      else
+      if (existing is null)
       {
-        dbContext.InventoryItems.Add(new InventoryItem
+        // First time seeing this date: drop if predated, otherwise initialize with clamp
+        var initialCount = Math.Max(0, adj.AvailableInventoryAdjustment);
+        db.InventoryItems.Add(new InventoryItem
         {
-          PropertyId = delta.PropertyId,
-          UnitTypeId = delta.UnitTypeId,
-          Date = adjustment.Date,
-          AvailableInventory = Math.Max(0, adjustment.AvailableInventoryAdjustment)
+          PropertyId = payload.PropertyId,
+          UnitTypeId = payload.UnitTypeId,
+          Date = adj.Date,
+          AvailableInventory = initialCount,
+          LastSnapshotUtc = DateTimeOffset.MinValue,
+          RecentEventIds = [payload.EventId]
         });
+        continue;
       }
+
+      // 1. Snapshot epoch check: discard deltas predating the authoritative baseline
+      if (payload.Timestamp < existing.LastSnapshotUtc)
+      {
+        logger?.LogWarning(
+            "Delta {EventId} for {Date} predates last snapshot baseline ({Baseline}). Skipping.",
+            payload.EventId, adj.Date, existing.LastSnapshotUtc);
+        continue;
+      }
+
+      // 2. Replay check: discard duplicate redeliveries
+      if (existing.RecentEventIds.Contains(payload.EventId))
+      {
+        logger?.LogInformation(
+            "Duplicate delta {EventId} detected for {Date}. Skipping.",
+            payload.EventId, adj.Date);
+        continue;
+      }
+
+      // 3. Apply adjustment with zero clamping
+      existing.AvailableInventory = Math.Max(0, existing.AvailableInventory + adj.AvailableInventoryAdjustment);
+
+      // 4. Update bounded ring buffer (reassign expression to ensure EF Core tracks mutation)
+      existing.RecentEventIds = [.. existing.RecentEventIds.TakeLast(19), payload.EventId];
     }
+
+    await db.SaveChangesAsync(ct);
   }
 }
