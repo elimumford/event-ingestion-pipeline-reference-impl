@@ -1,5 +1,5 @@
 using Api.Configuration;
-using Api.Endpoints.Events;
+using Api.Endpoints.Inventory;
 
 
 var builder = WebApplication.CreateBuilder(args);

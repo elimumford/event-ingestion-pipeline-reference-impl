@@ -1,12 +1,11 @@
-namespace Api.Endpoints.Events;
+namespace Api.Endpoints.Inventory;
 
 using Api.Domain.Events;
 using Api.Endpoints.Filters;
 using Api.Infrastructure;
 using Microsoft.AspNetCore.Http.HttpResults;
-using Microsoft.AspNetCore.Mvc;
 
-public static class EventEndpoints
+public static class InventoryEndpoints
 {
   public static RouteGroupBuilder MapEventEndpoints(this IEndpointRouteBuilder app)
   {
