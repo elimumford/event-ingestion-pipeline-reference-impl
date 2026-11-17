@@ -18,9 +18,24 @@ public sealed class SqsConsumerWorker(
 {
   private static readonly TextMapPropagator Propagator = Propagators.DefaultTextMapPropagator;
   private readonly SqsOptions _sqsOptions = sqsOptions.Value;
+  private readonly CancellationTokenSource _abortWrites = new();
+
+  public override async Task StopAsync(CancellationToken cancellationToken)
+  {
+    using var deadline = cancellationToken.Register(() => _abortWrites.Cancel());
+    await base.StopAsync(cancellationToken);
+  }
+
+  public override void Dispose()
+  {
+    _abortWrites.Cancel();
+    base.Dispose();
+    _abortWrites.Dispose();
+  }
 
   protected override async Task ExecuteAsync(CancellationToken stoppingToken)
   {
+    var drainToken = _abortWrites.Token;
     logger.LogInformation("SQS Poller worker started. Polling queue: {QueueUrl}", _sqsOptions.QueueUrl);
 
     var request = new ReceiveMessageRequest
@@ -28,62 +43,95 @@ public sealed class SqsConsumerWorker(
       QueueUrl = _sqsOptions.QueueUrl,
       MaxNumberOfMessages = 10,
       WaitTimeSeconds = 20, // SQS Long Polling
+      VisibilityTimeout = _sqsOptions.VisibilityTimeoutSeconds,
       MessageAttributeNames = ["All"]
     };
 
-    while (!stoppingToken.IsCancellationRequested)
+    try
     {
-      try
+      while (!stoppingToken.IsCancellationRequested)
       {
-        var response = await sqsClient.ReceiveMessageAsync(request, stoppingToken);
-
-        if (response.Messages.Count == 0)
+        try
         {
-          continue;
-        }
+          var response = await sqsClient.ReceiveMessageAsync(request, stoppingToken);
 
-        foreach (var message in response.Messages)
-        {
-          // Extract W3C trace context from SQS attributes
-          var propagationContext = Propagator.Extract(
-              default,
-              message.MessageAttributes,
-              static (attributes, key) =>
+          if (response.Messages is not { Count: > 0 })
+          {
+            continue;
+          }
+
+          // Start every lease before waiting for channel space, including the rest of the batch.
+          var envelopes = response.Messages.Select(message =>
+          {
+            var propagationContext = Propagator.Extract(
+                default,
+                message.MessageAttributes,
+                static (attributes, key) =>
+                {
+                  return attributes is not null && attributes.TryGetValue(key, out var attr) && !string.IsNullOrWhiteSpace(attr.StringValue)
+                                ? [attr.StringValue]
+                                : [];
+                }
+            );
+
+            var eventType = message.MessageAttributes?.TryGetValue("EventType", out var typeAttr) == true
+                ? typeAttr.StringValue
+                : "Unknown";
+
+            return new InventoryEventEnvelope(
+                message.MessageId,
+                message.ReceiptHandle,
+                eventType,
+                message.Body,
+                propagationContext
+            )
+            {
+              // Ownership transfers to the processor; polling cancellation must not end the lease.
+              VisibilityLease = new SqsVisibilityLease(
+                  sqsClient, _sqsOptions.QueueUrl, message.ReceiptHandle,
+                  _sqsOptions.VisibilityTimeoutSeconds, logger, CancellationToken.None)
+            };
+          }).ToArray();
+
+          var written = 0;
+          try
+          {
+            for (; written < envelopes.Length; written++)
+            {
+              // Finish transferring the received batch unless the host's shutdown budget expires.
+              await channelWriter.WriteAsync(envelopes[written], drainToken);
+            }
+          }
+          finally
+          {
+            for (var i = written; i < envelopes.Length; i++)
+            {
+              if (envelopes[i].VisibilityLease is { } lease)
               {
-                return attributes.TryGetValue(key, out var attr) && !string.IsNullOrWhiteSpace(attr.StringValue)
-                              ? [attr.StringValue]
-                              : [];
+                await lease.DisposeAsync();
               }
-          );
-
-          var eventType = message.MessageAttributes.TryGetValue("EventType", out var typeAttr)
-              ? typeAttr.StringValue
-              : "Unknown";
-
-          var envelope = new InventoryEventEnvelope(
-              message.MessageId,
-              message.ReceiptHandle,
-              eventType,
-              message.Body,
-              propagationContext
-          );
-
-          // Push to channel applying backpressure if full
-          await channelWriter.WriteAsync(envelope, stoppingToken);
+            }
+          }
         }
-      }
-      catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-      {
-        break;
-      }
-      catch (Exception ex)
-      {
-        logger.LogError(ex, "Transient error occurred while polling SQS. Backing off 2 seconds.");
-        await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested || drainToken.IsCancellationRequested)
+        {
+          break;
+        }
+        catch (Exception ex)
+        {
+          logger.LogError(ex, "Transient error occurred while polling SQS. Backing off 2 seconds.");
+          await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+        }
       }
     }
-
-    channelWriter.Complete();
-    logger.LogInformation("SQS Poller worker stopped cleanly.");
+    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+    {
+      logger.LogInformation("SQS polling backoff cancelled for shutdown.");
+    }
+    finally
+    {
+      channelWriter.TryComplete();
+      logger.LogInformation("SQS Poller worker stopped; channel writer completed.");
+    }
   }
 }

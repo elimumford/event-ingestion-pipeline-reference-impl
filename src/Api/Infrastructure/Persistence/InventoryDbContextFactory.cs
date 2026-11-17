@@ -23,6 +23,6 @@ public sealed class InventoryDbContextFactory : IDesignTimeDbContextFactory<Inve
     var builder = new DbContextOptionsBuilder<InventoryDbContext>();
     builder.UseNpgsql(connectionString);
 
-    return new InventoryDbContext(builder.Options);
+    return new InventoryDbContext(builder.Options, TimeProvider.System);
   }
 }

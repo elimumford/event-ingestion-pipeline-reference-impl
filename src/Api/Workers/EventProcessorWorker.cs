@@ -22,17 +22,57 @@ public sealed class EventProcessorWorker(
     IAmazonSQS sqsClient,
     IOptions<SqsOptions> sqsOptions,
     IServiceScopeFactory scopeFactory,
+    IInventoryConflictClassifier conflictClassifier,
     ILogger<EventProcessorWorker> logger) : BackgroundService
 {
+  private const int MaxConcurrencyAttempts = 4;
   private readonly SqsOptions _sqsOptions = sqsOptions.Value;
+
+  public override async Task StopAsync(CancellationToken cancellationToken)
+  {
+    try
+    {
+      if (ExecuteTask is { } execution)
+      {
+        await execution.WaitAsync(cancellationToken);
+      }
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+      logger.LogWarning("Shutdown deadline reached. Cancelling inventory processing; unfinished messages will be redelivered.");
+    }
+    finally
+    {
+      await base.StopAsync(cancellationToken);
+    }
+  }
 
   protected override async Task ExecuteAsync(CancellationToken stoppingToken)
   {
     logger.LogInformation("Event Processor worker started.");
 
-    await foreach (var envelope in channelReader.ReadAllAsync(stoppingToken))
+    try
     {
-      await ProcessEnvelopeAsync(envelope, stoppingToken);
+      await foreach (var envelope in channelReader.ReadAllAsync(stoppingToken))
+      {
+        await ProcessEnvelopeAsync(envelope, stoppingToken);
+        stoppingToken.ThrowIfCancellationRequested();
+      }
+    }
+    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+    {
+      logger.LogWarning("Event Processor worker cancelled before the channel was fully drained.");
+      return;
+    }
+    finally
+    {
+      while (channelReader.TryRead(out var pending))
+      {
+        if (pending.VisibilityLease is { } lease)
+        {
+          await lease.DisposeAsync();
+        }
+      }
     }
 
     logger.LogInformation("Event Processor worker drained and completed.");
@@ -40,6 +80,12 @@ public sealed class EventProcessorWorker(
 
   private async Task ProcessEnvelopeAsync(InventoryEventEnvelope envelope, CancellationToken cancellationToken)
   {
+    await using var lease = envelope.VisibilityLease;
+    using var attemptCancellation = lease is null
+        ? null
+        : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lease.LeaseLostToken);
+    cancellationToken = attemptCancellation?.Token ?? cancellationToken;
+
     using var activity = Diagnostics.ActivitySource.StartActivity(
         "inventory.process",
         ActivityKind.Consumer,
@@ -50,48 +96,80 @@ public sealed class EventProcessorWorker(
     activity?.SetTag("messaging.message_id", envelope.MessageId);
     activity?.SetTag("messaging.event_type", envelope.EventType);
 
-    try
+    for (var attempt = 1; attempt <= MaxConcurrencyAttempts; attempt++)
     {
-      using (var scope = scopeFactory.CreateScope())
+      try
       {
-        var dbContext = scope.ServiceProvider.GetRequiredService<InventoryDbContext>();
+        cancellationToken.ThrowIfCancellationRequested();
+        await ProcessEnvelopeAttemptAsync(envelope, cancellationToken);
 
-        switch (envelope.EventType)
+        if (lease is not null)
         {
-          case nameof(InventorySnapshotUpdated):
-            var snapshot = JsonSerializer.Deserialize<InventorySnapshotUpdated>(envelope.Body);
-            if (snapshot is not null)
-            {
-              await HandleSnapshotAsync(dbContext, snapshot, logger, cancellationToken);
-            }
-            break;
-
-          case nameof(InventoryDeltaAdjusted):
-            var delta = JsonSerializer.Deserialize<InventoryDeltaAdjusted>(envelope.Body);
-            if (delta is not null)
-            {
-              await HandleDeltaAsync(dbContext, delta, logger, cancellationToken);
-            }
-            break;
-
-          default:
-            logger.LogWarning("Unrecognized event type {EventType}. Skipping dispatch.", envelope.EventType);
-            break;
+          await lease.StopRenewalAsync();
         }
+        cancellationToken.ThrowIfCancellationRequested();
+        await sqsClient.DeleteMessageAsync(new DeleteMessageRequest
+        {
+          QueueUrl = _sqsOptions.QueueUrl,
+          ReceiptHandle = envelope.ReceiptHandle
+        }, cancellationToken);
 
-        await dbContext.SaveChangesAsync(cancellationToken);
+        return;
       }
-
-      // Acknowledge and delete message only after persistence commits
-      await sqsClient.DeleteMessageAsync(new DeleteMessageRequest
+      catch (Exception ex) when (attempt < MaxConcurrencyAttempts && conflictClassifier.IsRetryableConflict(ex))
       {
-        QueueUrl = _sqsOptions.QueueUrl,
-        ReceiptHandle = envelope.ReceiptHandle
-      }, cancellationToken);
+        logger.LogWarning(
+            ex,
+            "Concurrent inventory update for message {MessageId}; retrying attempt {Attempt}/{MaxAttempts}.",
+            envelope.MessageId,
+            attempt + 1,
+            MaxConcurrencyAttempts);
+
+        try
+        {
+          await Task.Delay(TimeSpan.FromMilliseconds(attempt * 25), cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+          return;
+        }
+      }
+      catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+      {
+        logger.LogWarning("Processing message {MessageId} cancelled. Leaving on queue for redelivery.", envelope.MessageId);
+        return;
+      }
+      catch (Exception ex)
+      {
+        logger.LogError(ex, "Failed to process message {MessageId}. Leaving on queue for redelivery.", envelope.MessageId);
+        return;
+      }
     }
-    catch (Exception ex)
+  }
+
+  private async Task ProcessEnvelopeAttemptAsync(
+      InventoryEventEnvelope envelope,
+      CancellationToken cancellationToken)
+  {
+    using var scope = scopeFactory.CreateScope();
+    var dbContext = scope.ServiceProvider.GetRequiredService<InventoryDbContext>();
+
+    switch (envelope.EventType)
     {
-      logger.LogError(ex, "Failed to process message {MessageId}. Leaving on queue for redelivery.", envelope.MessageId);
+      case nameof(InventorySnapshotUpdated):
+        var snapshot = JsonSerializer.Deserialize<InventorySnapshotUpdated>(envelope.Body)
+            ?? throw new JsonException("Inventory snapshot payload cannot be null.");
+        await HandleSnapshotAsync(dbContext, snapshot, logger, cancellationToken);
+        break;
+
+      case nameof(InventoryDeltaAdjusted):
+        var delta = JsonSerializer.Deserialize<InventoryDeltaAdjusted>(envelope.Body)
+            ?? throw new JsonException("Inventory delta payload cannot be null.");
+        await HandleDeltaAsync(dbContext, delta, logger, cancellationToken);
+        break;
+
+      default:
+        throw new NotSupportedException($"Inventory event type '{envelope.EventType}' is not supported.");
     }
   }
 
@@ -123,11 +201,11 @@ public sealed class EventProcessorWorker(
       }
       else
       {
-        // Drop stale snapshots that arrived out of order
-        if (payload.Timestamp < existing.LastSnapshotUtc)
+        // A snapshot must advance the baseline; equal timestamps have no reliable ordering.
+        if (payload.Timestamp <= existing.LastSnapshotUtc)
         {
           logger?.LogWarning(
-              "Stale snapshot {EventId} for {Date} ignored. Snapshot timestamp {Timestamp} predates baseline {Baseline}",
+              "Snapshot {EventId} for {Date} ignored. Timestamp {Timestamp} does not advance baseline {Baseline}",
               payload.EventId, count.Date, payload.Timestamp, existing.LastSnapshotUtc);
           continue;
         }

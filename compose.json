@@ -1,0 +1,73 @@
+{
+  "name": "event-ingestion-pipeline",
+  "services": {
+    "elasticmq": {
+      "container_name": "elasticmq",
+      "image": "softwaremill/elasticmq-native@sha256:e4580ab9ad1bd5cd37b4ba04911bc5ccc8cd2d9ab4de56ece65acee71c24e05c",
+      "restart": "unless-stopped",
+      "ports": [
+        {
+          "target": 9324,
+          "published": "9324",
+          "host_ip": "127.0.0.1",
+          "protocol": "tcp"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "./docker/elasticmq/elasticmq.conf",
+          "target": "/opt/elasticmq.conf",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "healthcheck": {
+        "test": ["CMD-SHELL", "wget -q -O /dev/null 'http://127.0.0.1:9324/?Action=ListQueues'"],
+        "interval": "2s",
+        "timeout": "2s",
+        "retries": 30,
+        "start_period": "5s"
+      }
+    },
+    "postgres-dev": {
+      "container_name": "postgres-dev",
+      "image": "postgres:17-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac",
+      "restart": "unless-stopped",
+      "ports": [
+        {
+          "target": 5432,
+          "published": "5432",
+          "host_ip": "127.0.0.1",
+          "protocol": "tcp"
+        }
+      ],
+      "environment": {
+        "POSTGRES_USER": "postgres",
+        "POSTGRES_PASSWORD": "postgres",
+        "POSTGRES_DB": "inventory_db"
+      },
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "postgres-data",
+          "target": "/var/lib/postgresql/data"
+        }
+      ],
+      "healthcheck": {
+        "test": ["CMD-SHELL", "pg_isready -U postgres -d inventory_db"],
+        "interval": "2s",
+        "timeout": "2s",
+        "retries": 30,
+        "start_period": "5s"
+      }
+    }
+  },
+  "volumes": {
+    "postgres-data": {
+      "name": "event-ingestion-pipeline-postgres-data"
+    }
+  }
+}

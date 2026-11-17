@@ -52,6 +52,12 @@ namespace Api.Migrations
                         .IsRequired()
                         .HasColumnType("text[]");
 
+                    b.Property<uint>("xmin")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAddOrUpdate()
+                        .HasColumnType("xid")
+                        .HasColumnName("xmin");
+
                     b.HasKey("PropertyId", "UnitTypeId", "Date");
 
                     b.ToTable("inventory_items", (string)null);

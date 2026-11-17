@@ -5,55 +5,134 @@ using Api.Domain.Events;
 using Api.Domain.Inventory;
 using Api.Infrastructure.Persistence;
 using Api.Workers;
+using IntegrationTests.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
 
-public class EventProcessorWorkerTests
+public class EventProcessorWorkerTests(CustomWebApplicationFactory factory)
+    : IClassFixture<CustomWebApplicationFactory>
 {
-  private static InventoryDbContext CreateInMemoryDbContext()
+  private readonly string _propertyId = $"prop-{Guid.NewGuid():N}";
+  private readonly TestTimeProvider _timeProvider = new(
+      new DateTimeOffset(2026, 11, 16, 12, 0, 0, TimeSpan.Zero));
+
+  private InventoryDbContext CreateDbContext()
   {
     var options = new DbContextOptionsBuilder<InventoryDbContext>()
-        .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
+        .UseNpgsql(factory.ConnectionString)
         .Options;
 
-    return new InventoryDbContext(options);
+    return new InventoryDbContext(options, _timeProvider);
+  }
+
+  [Theory]
+  [InlineData(false)]
+  [InlineData(true)]
+  public async Task SaveChanges_MaintainsAuditTimestamps_WithoutUpdatingUnchangedRows(bool useAsync)
+  {
+    await using var db = CreateDbContext();
+    var createdAt = _timeProvider.UtcNow;
+    var date = new DateOnly(2026, 11, 16);
+    db.InventoryItems.AddRange(
+        new InventoryItem
+        {
+          PropertyId = _propertyId,
+          UnitTypeId = "standard",
+          Date = date,
+          AvailableInventory = 10,
+          CreatedAtUtc = createdAt.AddYears(-1),
+          LastUpdatedUtc = createdAt.AddYears(-1)
+        },
+        new InventoryItem
+        {
+          PropertyId = _propertyId,
+          UnitTypeId = "standard",
+          Date = date.AddDays(1),
+          AvailableInventory = 5
+        });
+
+    Assert.Equal(2, useAsync ? await db.SaveChangesAsync() : db.SaveChanges());
+    db.ChangeTracker.Clear();
+    var inserted = await db.InventoryItems.Where(item => item.PropertyId == _propertyId)
+        .OrderBy(item => item.Date).ToListAsync();
+    Assert.All(inserted, item =>
+    {
+      Assert.Equal(createdAt, item.CreatedAtUtc);
+      Assert.Equal(createdAt, item.LastUpdatedUtc);
+    });
+
+    _timeProvider.UtcNow = createdAt.AddHours(1);
+    inserted[0].AvailableInventory = 8;
+    inserted[0].CreatedAtUtc = createdAt.AddYears(1);
+    inserted[0].LastUpdatedUtc = DateTimeOffset.MinValue;
+    Assert.Equal(1, useAsync
+        ? await db.SaveChangesAsync(acceptAllChangesOnSuccess: true)
+        : db.SaveChanges(acceptAllChangesOnSuccess: true));
+
+    db.ChangeTracker.Clear();
+    var updated = await db.InventoryItems.Where(item => item.PropertyId == _propertyId)
+        .OrderBy(item => item.Date).ToListAsync();
+    Assert.Equal(createdAt, updated[0].CreatedAtUtc);
+    Assert.Equal(_timeProvider.UtcNow, updated[0].LastUpdatedUtc);
+    Assert.Equal(8, updated[0].AvailableInventory);
+    Assert.Equal(createdAt, updated[1].CreatedAtUtc);
+    Assert.Equal(createdAt, updated[1].LastUpdatedUtc);
+    var updatedAt = updated[0].LastUpdatedUtc;
+
+    _timeProvider.UtcNow = createdAt.AddHours(2);
+    Assert.Equal(0, useAsync ? await db.SaveChangesAsync() : db.SaveChanges());
+
+    // Changing only creation metadata must not create an audit-only update.
+    updated[0].CreatedAtUtc = createdAt.AddYears(2);
+    Assert.Equal(0, useAsync ? await db.SaveChangesAsync() : db.SaveChanges());
+    db.ChangeTracker.Clear();
+    var unchanged = await db.InventoryItems.SingleAsync(
+        item => item.PropertyId == _propertyId && item.Date == date);
+    Assert.Equal(createdAt, unchanged.CreatedAtUtc);
+    Assert.Equal(updatedAt, unchanged.LastUpdatedUtc);
   }
 
   [Fact]
   public async Task HandleSnapshotAsync_InsertsNewItems_AndUpdatesExistingItems()
   {
     // Arrange
-    await using var dbContext = CreateInMemoryDbContext();
+    await using var dbContext = CreateDbContext();
     var existingDate = new DateOnly(2026, 11, 10);
     var newDate = new DateOnly(2026, 11, 11);
 
     dbContext.InventoryItems.Add(new InventoryItem
     {
-      PropertyId = "prop-slc-01",
+      PropertyId = _propertyId,
       UnitTypeId = "unit-deluxe-queen",
       Date = existingDate,
-      AvailableInventory = 3
+      AvailableInventory = 3,
+      LastSnapshotUtc = new DateTimeOffset(2026, 11, 1, 0, 0, 0, TimeSpan.Zero),
+      RecentEventIds = ["previous-event"]
     });
     await dbContext.SaveChangesAsync();
+    dbContext.ChangeTracker.Clear();
+    var originalCreatedAt = _timeProvider.UtcNow;
+    _timeProvider.UtcNow = originalCreatedAt.AddHours(1);
 
     var snapshot = new InventorySnapshotUpdated(
         EventId: Guid.NewGuid().ToString(),
-        PropertyId: "prop-slc-01",
+        PropertyId: _propertyId,
         UnitTypeId: "unit-deluxe-queen",
         Counts:
         [
             new NightlyInventory(existingDate, 10),
             new NightlyInventory(newDate, 7)
         ],
-        Timestamp: DateTimeOffset.UtcNow
+        Timestamp: new DateTimeOffset(2026, 11, 10, 12, 0, 0, TimeSpan.Zero)
     );
 
     // Act
     await EventProcessorWorker.HandleSnapshotAsync(dbContext, snapshot, null, CancellationToken.None);
-    await dbContext.SaveChangesAsync();
+    dbContext.ChangeTracker.Clear();
 
     // Assert
     var items = await dbContext.InventoryItems
+        .Where(i => i.PropertyId == _propertyId)
         .OrderBy(i => i.Date)
         .ToListAsync();
 
@@ -62,13 +141,21 @@ public class EventProcessorWorkerTests
     Assert.Equal(10, items[0].AvailableInventory);
     Assert.Equal(newDate, items[1].Date);
     Assert.Equal(7, items[1].AvailableInventory);
+    Assert.All(items, item =>
+    {
+      Assert.Equal(snapshot.Timestamp, item.LastSnapshotUtc);
+      Assert.Equal([snapshot.EventId], item.RecentEventIds);
+      Assert.Equal(_timeProvider.UtcNow, item.LastUpdatedUtc);
+    });
+    Assert.Equal(originalCreatedAt, items[0].CreatedAtUtc);
+    Assert.Equal(_timeProvider.UtcNow, items[1].CreatedAtUtc);
   }
 
   [Fact]
   public async Task HandleDeltaAsync_AppliesAdjustments_AndClampsNegativeInventoryToZero()
   {
     // Arrange
-    await using var dbContext = CreateInMemoryDbContext();
+    await using var dbContext = CreateDbContext();
     var datePositiveDelta = new DateOnly(2026, 11, 10);
     var dateClampedExisting = new DateOnly(2026, 11, 11);
     var dateClampedNew = new DateOnly(2026, 11, 12);
@@ -77,24 +164,25 @@ public class EventProcessorWorkerTests
     dbContext.InventoryItems.AddRange(
         new InventoryItem
         {
-          PropertyId = "prop-slc-01",
+          PropertyId = _propertyId,
           UnitTypeId = "unit-deluxe-queen",
           Date = datePositiveDelta,
           AvailableInventory = 5
         },
         new InventoryItem
         {
-          PropertyId = "prop-slc-01",
+          PropertyId = _propertyId,
           UnitTypeId = "unit-deluxe-queen",
           Date = dateClampedExisting,
           AvailableInventory = 2
         }
     );
     await dbContext.SaveChangesAsync();
+    dbContext.ChangeTracker.Clear();
 
     var delta = new InventoryDeltaAdjusted(
         EventId: Guid.NewGuid().ToString(),
-        PropertyId: "prop-slc-01",
+        PropertyId: _propertyId,
         UnitTypeId: "unit-deluxe-queen",
         Adjustments:
         [
@@ -108,10 +196,11 @@ public class EventProcessorWorkerTests
 
     // Act
     await EventProcessorWorker.HandleDeltaAsync(dbContext, delta, null, CancellationToken.None);
-    await dbContext.SaveChangesAsync();
+    dbContext.ChangeTracker.Clear();
 
     // Assert
     var items = await dbContext.InventoryItems
+        .Where(i => i.PropertyId == _propertyId)
         .OrderBy(i => i.Date)
         .ToDictionaryAsync(i => i.Date, i => i.AvailableInventory);
 
@@ -126,8 +215,8 @@ public class EventProcessorWorkerTests
   public async Task HandleDeltaAsync_DuplicateEventId_IsSuppressedAndNotDoubleCounted()
   {
     // Arrange
-    using var db = CreateInMemoryDbContext();
-    var propertyId = "prop-1";
+    await using var db = CreateDbContext();
+    var propertyId = _propertyId;
     var unitTypeId = "deluxe-king";
     var date = new DateOnly(2026, 11, 20);
 
@@ -142,6 +231,7 @@ public class EventProcessorWorkerTests
       RecentEventIds = ["evt-existing"]
     });
     await db.SaveChangesAsync();
+    db.ChangeTracker.Clear();
 
     var deltaPayload = new InventoryDeltaAdjusted(
         EventId: "evt-delta-dup",
@@ -152,26 +242,32 @@ public class EventProcessorWorkerTests
     );
 
     // Act: First run applies adjustment
+    _timeProvider.UtcNow = _timeProvider.UtcNow.AddHours(1);
     await EventProcessorWorker.HandleDeltaAsync(db, deltaPayload);
-    var firstState = await db.InventoryItems.FirstAsync(x => x.Date == date);
+    db.ChangeTracker.Clear();
+    var firstState = await db.InventoryItems.SingleAsync(x => x.PropertyId == propertyId && x.Date == date);
     Assert.Equal(8, firstState.AvailableInventory);
     Assert.Contains("evt-delta-dup", firstState.RecentEventIds);
 
     // Act: Second run with same EventId (simulating SQS replay)
+    _timeProvider.UtcNow = _timeProvider.UtcNow.AddHours(1);
     await EventProcessorWorker.HandleDeltaAsync(db, deltaPayload);
-    var replayState = await db.InventoryItems.FirstAsync(x => x.Date == date);
+    db.ChangeTracker.Clear();
+    var replayState = await db.InventoryItems.SingleAsync(x => x.PropertyId == propertyId && x.Date == date);
 
     // Assert: Inventory remains 8 (not decremented to 6)
     Assert.Equal(8, replayState.AvailableInventory);
     Assert.Single(replayState.RecentEventIds, id => id == "evt-delta-dup");
+    Assert.Equal(firstState.CreatedAtUtc, replayState.CreatedAtUtc);
+    Assert.Equal(firstState.LastUpdatedUtc, replayState.LastUpdatedUtc);
   }
 
   [Fact]
   public async Task HandleDeltaAsync_DeltaPredatingLastSnapshot_IsDiscarded()
   {
     // Arrange
-    using var db = CreateInMemoryDbContext();
-    var propertyId = "prop-1";
+    await using var db = CreateDbContext();
+    var propertyId = _propertyId;
     var unitTypeId = "suite";
     var date = new DateOnly(2026, 11, 21);
     var snapshotTime = DateTimeOffset.UtcNow;
@@ -186,6 +282,7 @@ public class EventProcessorWorkerTests
       RecentEventIds = ["evt-snap"]
     });
     await db.SaveChangesAsync();
+    db.ChangeTracker.Clear();
 
     // Delta created 10 minutes BEFORE the snapshot
     var staleDelta = new InventoryDeltaAdjusted(
@@ -197,20 +294,25 @@ public class EventProcessorWorkerTests
     );
 
     // Act
+    var seededAt = _timeProvider.UtcNow;
+    _timeProvider.UtcNow = seededAt.AddHours(1);
     await EventProcessorWorker.HandleDeltaAsync(db, staleDelta);
-    var result = await db.InventoryItems.FirstAsync(x => x.Date == date);
+    db.ChangeTracker.Clear();
+    var result = await db.InventoryItems.SingleAsync(x => x.PropertyId == propertyId && x.Date == date);
 
     // Assert: Delta is ignored because the snapshot baseline supersedes it
     Assert.Equal(5, result.AvailableInventory);
     Assert.DoesNotContain("evt-stale-delta", result.RecentEventIds);
+    Assert.Equal(seededAt, result.CreatedAtUtc);
+    Assert.Equal(seededAt, result.LastUpdatedUtc);
   }
 
   [Fact]
   public async Task HandleDeltaAsync_RingBuffer_CapsAtMaxCapacity()
   {
     // Arrange
-    using var db = CreateInMemoryDbContext();
-    var propertyId = "prop-1";
+    await using var db = CreateDbContext();
+    var propertyId = _propertyId;
     var unitTypeId = "standard";
     var date = new DateOnly(2026, 11, 22);
 
@@ -224,6 +326,7 @@ public class EventProcessorWorkerTests
       RecentEventIds = Enumerable.Range(1, 20).Select(i => $"evt-initial-{i}").ToList()
     });
     await db.SaveChangesAsync();
+    db.ChangeTracker.Clear();
 
     var newDelta = new InventoryDeltaAdjusted(
         EventId: "evt-newest-21",
@@ -235,23 +338,26 @@ public class EventProcessorWorkerTests
 
     // Act
     await EventProcessorWorker.HandleDeltaAsync(db, newDelta);
-    var result = await db.InventoryItems.FirstAsync(x => x.Date == date);
+    db.ChangeTracker.Clear();
+    var result = await db.InventoryItems.SingleAsync(x => x.PropertyId == propertyId && x.Date == date);
 
     // Assert: Buffer size remains 20, oldest entry evicted, newest appended
     Assert.Equal(20, result.RecentEventIds.Count);
     Assert.DoesNotContain("evt-initial-1", result.RecentEventIds);
     Assert.Equal("evt-newest-21", result.RecentEventIds.Last());
+    Assert.Equal(Enumerable.Range(2, 19).Select(i => $"evt-initial-{i}").Append(newDelta.EventId),
+        result.RecentEventIds);
   }
 
   [Fact]
   public async Task HandleSnapshotAsync_StaleSnapshot_IsIgnored()
   {
     // Arrange
-    using var db = CreateInMemoryDbContext();
-    var propertyId = "prop-1";
+    await using var db = CreateDbContext();
+    var propertyId = _propertyId;
     var unitTypeId = "standard";
     var date = new DateOnly(2026, 11, 23);
-    var baselineTime = DateTimeOffset.UtcNow;
+    var baselineTime = new DateTimeOffset(2026, 11, 23, 12, 0, 0, TimeSpan.Zero);
 
     db.InventoryItems.Add(new InventoryItem
     {
@@ -263,6 +369,7 @@ public class EventProcessorWorkerTests
       RecentEventIds = ["evt-current-snap"]
     });
     await db.SaveChangesAsync();
+    db.ChangeTracker.Clear();
 
     // Snapshot with older timestamp
     var staleSnapshot = new InventorySnapshotUpdated(
@@ -274,12 +381,65 @@ public class EventProcessorWorkerTests
     );
 
     // Act
+    var seededAt = _timeProvider.UtcNow;
+    _timeProvider.UtcNow = seededAt.AddHours(1);
     await EventProcessorWorker.HandleSnapshotAsync(db, staleSnapshot);
-    var result = await db.InventoryItems.FirstAsync(x => x.Date == date);
+    db.ChangeTracker.Clear();
+    var result = await db.InventoryItems.SingleAsync(x => x.PropertyId == propertyId && x.Date == date);
 
     // Assert: Stale snapshot did not overwrite current baseline
     Assert.Equal(10, result.AvailableInventory);
     Assert.Equal(baselineTime, result.LastSnapshotUtc);
     Assert.DoesNotContain("evt-stale-snap", result.RecentEventIds);
+    Assert.Equal(seededAt, result.CreatedAtUtc);
+    Assert.Equal(seededAt, result.LastUpdatedUtc);
+  }
+
+  [Fact]
+  public async Task HandleSnapshotAsync_EqualTimestampSnapshot_IsIgnoredEvenAfterIdEviction()
+  {
+    await using var db = CreateDbContext();
+    var propertyId = _propertyId;
+    var unitTypeId = "standard";
+    var date = new DateOnly(2026, 11, 24);
+    var baselineTime = new DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero);
+
+    db.InventoryItems.Add(new InventoryItem
+    {
+      PropertyId = propertyId,
+      UnitTypeId = unitTypeId,
+      Date = date,
+      AvailableInventory = 8,
+      LastSnapshotUtc = baselineTime,
+      RecentEventIds = Enumerable.Range(1, 20).Select(i => $"evt-{i}").ToList()
+    });
+    await db.SaveChangesAsync();
+    db.ChangeTracker.Clear();
+
+    var replayedSnapshot = new InventorySnapshotUpdated(
+        EventId: "evt-evicted-snapshot",
+        Timestamp: baselineTime,
+        PropertyId: propertyId,
+        UnitTypeId: unitTypeId,
+        Counts: [new NightlyInventory(date, 25)]
+    );
+
+    var seededAt = _timeProvider.UtcNow;
+    _timeProvider.UtcNow = seededAt.AddHours(1);
+    await EventProcessorWorker.HandleSnapshotAsync(db, replayedSnapshot);
+    db.ChangeTracker.Clear();
+    var result = await db.InventoryItems.SingleAsync(x => x.PropertyId == propertyId && x.Date == date);
+
+    Assert.Equal(8, result.AvailableInventory);
+    Assert.Equal(baselineTime, result.LastSnapshotUtc);
+    Assert.DoesNotContain(replayedSnapshot.EventId, result.RecentEventIds);
+    Assert.Equal(seededAt, result.CreatedAtUtc);
+    Assert.Equal(seededAt, result.LastUpdatedUtc);
+  }
+
+  private sealed class TestTimeProvider(DateTimeOffset utcNow) : TimeProvider
+  {
+    public DateTimeOffset UtcNow { get; set; } = utcNow;
+    public override DateTimeOffset GetUtcNow() => UtcNow;
   }
 }

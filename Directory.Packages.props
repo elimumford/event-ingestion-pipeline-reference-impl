@@ -17,10 +17,10 @@
     <PackageVersion Include="AWSSDK.SQS" Version="4.*" />
     <PackageVersion Include="OpenTelemetry.Exporter.Console" Version="1.*" />
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.*" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.*" />
     <!-- Test-only packages: referenced only by the integration-test project. -->
     <PackageVersion Include="coverlet.collector" Version="6.*" />
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.*" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.*" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.*" />
     <PackageVersion Include="Testcontainers.PostgreSql" Version="4.*" />
     <PackageVersion Include="xunit" Version="2.9.*" />

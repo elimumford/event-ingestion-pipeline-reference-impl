@@ -2,35 +2,36 @@ namespace IntegrationTests.Infrastructure;
 
 using Api.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Testcontainers.PostgreSql;
 using Xunit;
 
-public class CustomWebApplicationFactory : WebApplicationFactory<Program>, IAsyncLifetime
+public class CustomWebApplicationFactory : TestApiApplication, IAsyncLifetime
 {
-  private readonly PostgreSqlContainer _dbContainer = new PostgreSqlBuilder("postgres:17-alpine")
+  private readonly PostgreSqlContainer _dbContainer = new PostgreSqlBuilder(DevelopmentInfrastructure.PostgresImage)
       .WithDatabase("inventory_test_db")
       .WithUsername("postgres")
       .WithPassword("postgres")
       .Build();
 
+  public string ConnectionString => _dbContainer.GetConnectionString();
+
   public async Task InitializeAsync()
   {
     await _dbContainer.StartAsync();
 
-    using var scope = Services.CreateScope();
+    await using var scope = Services.CreateAsyncScope();
     var db = scope.ServiceProvider.GetRequiredService<InventoryDbContext>();
     await db.Database.MigrateAsync();
   }
 
   protected override void ConfigureWebHost(IWebHostBuilder builder)
   {
+    base.ConfigureWebHost(builder);
+
     builder.ConfigureServices(services =>
     {
-      // 1. Remove Postgres registration and point to Testcontainer
       var descriptor = services.SingleOrDefault(d =>
           d.ServiceType == typeof(DbContextOptions<InventoryDbContext>));
       if (descriptor is not null) services.Remove(descriptor);
@@ -39,22 +40,20 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>, IAsyn
       {
         options.UseNpgsql(_dbContainer.GetConnectionString());
       });
-
-      // 2. Remove background consumer workers for pure ingestion tests
-      var hostedServices = services
-          .Where(d => d.ServiceType == typeof(IHostedService))
-          .ToList();
-
-      foreach (var worker in hostedServices)
-      {
-        services.Remove(worker);
-      }
     });
   }
 
-  public new async Task DisposeAsync()
+  Task IAsyncLifetime.DisposeAsync() => DisposeAsync().AsTask();
+
+  public override async ValueTask DisposeAsync()
   {
-    await _dbContainer.StopAsync();
-    await _dbContainer.DisposeAsync();
+    try
+    {
+      await base.DisposeAsync();
+    }
+    finally
+    {
+      await _dbContainer.DisposeAsync();
+    }
   }
 }

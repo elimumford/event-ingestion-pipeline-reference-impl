@@ -8,4 +8,7 @@ public sealed record InventoryEventEnvelope(
     string EventType,
     string Body,
     PropagationContext PropagationContext
-);
+)
+{
+  public SqsVisibilityLease? VisibilityLease { get; init; }
+}

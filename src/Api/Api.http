@@ -1,0 +1,7 @@
+@baseUrl = http://localhost:5159
+
+### Readiness: 200 when PostgreSQL and SQS are reachable; otherwise 503
+GET {{baseUrl}}/healthz
+
+### Liveness: independent of PostgreSQL and SQS availability
+GET {{baseUrl}}/livez

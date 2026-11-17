@@ -14,23 +14,39 @@ public class ValidationFilter<T> : IEndpointFilter where T : class
       return TypedResults.BadRequest("Request payload cannot be null.");
     }
 
-    // Domain-level validation guards for inbound events
+    if (argument is IInventoryEvent inventoryEvent)
+    {
+      if (string.IsNullOrWhiteSpace(inventoryEvent.EventId))
+      {
+        return TypedResults.BadRequest("EventId is required.");
+      }
+
+      if (string.IsNullOrWhiteSpace(inventoryEvent.PropertyId) ||
+          inventoryEvent.PropertyId.Length > 128 ||
+          string.IsNullOrWhiteSpace(inventoryEvent.UnitTypeId) ||
+          inventoryEvent.UnitTypeId.Length > 128)
+      {
+        return TypedResults.BadRequest("PropertyId and UnitTypeId are required and must not exceed 128 characters.");
+      }
+    }
+
     if (argument is InventorySnapshotUpdated snapshot)
     {
-      if (string.IsNullOrWhiteSpace(snapshot.PropertyId) ||
-          string.IsNullOrWhiteSpace(snapshot.UnitTypeId) ||
-          snapshot.Counts.Count == 0)
+      if (snapshot.Counts is not { Count: > 0 })
       {
-        return TypedResults.BadRequest("PropertyId and UnitTypeId are required, and Counts must contain at least one date.");
+        return TypedResults.BadRequest("Counts must contain at least one date.");
+      }
+
+      if (snapshot.Counts.Any(count => count.AvailableInventory < 0))
+      {
+        return TypedResults.BadRequest("Snapshot inventory counts must not be negative.");
       }
     }
     else if (argument is InventoryDeltaAdjusted delta)
     {
-      if (string.IsNullOrWhiteSpace(delta.PropertyId) ||
-          string.IsNullOrWhiteSpace(delta.UnitTypeId) ||
-          delta.Adjustments.Count == 0)
+      if (delta.Adjustments is not { Count: > 0 })
       {
-        return TypedResults.BadRequest("PropertyId and UnitTypeId are required, and Adjustments must contain at least one date.");
+        return TypedResults.BadRequest("Adjustments must contain at least one date.");
       }
     }
 

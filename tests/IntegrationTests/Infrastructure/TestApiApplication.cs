@@ -1,9 +1,11 @@
 namespace IntegrationTests.Infrastructure;
 
 using Api.Infrastructure;
+using Api.Workers;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 public class TestApiApplication : WebApplicationFactory<Program>
 {
@@ -13,6 +15,16 @@ public class TestApiApplication : WebApplicationFactory<Program>
   {
     builder.ConfigureServices(services =>
     {
+      var workers = services.Where(d =>
+          d.ServiceType == typeof(IHostedService) &&
+          (d.ImplementationType == typeof(SqsConsumerWorker) ||
+           d.ImplementationType == typeof(EventProcessorWorker))).ToList();
+
+      foreach (var worker in workers)
+      {
+        services.Remove(worker);
+      }
+
       // Remove the production/logging publisher registration
       var descriptor = services.FirstOrDefault(d =>
               d.ServiceType == typeof(IEventPublisher) &&

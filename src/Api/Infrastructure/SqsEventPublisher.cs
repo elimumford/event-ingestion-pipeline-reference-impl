@@ -27,7 +27,7 @@ public sealed class SqsEventPublisher(
   public async ValueTask PublishAsync<TEvent>(TEvent @event, CancellationToken cancellationToken = default)
       where TEvent : IInventoryEvent
   {
-    using var activity = Diagnostics.ActivitySource.StartActivity("sqs.publish");
+    using var activity = Diagnostics.ActivitySource.StartActivity("sqs.publish", ActivityKind.Producer);
 
     var messageBody = JsonSerializer.Serialize(@event);
 
