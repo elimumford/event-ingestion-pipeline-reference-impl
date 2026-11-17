@@ -4,6 +4,7 @@ using System.Text.Json;
 using Amazon.SQS;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
+using DotNet.Testcontainers.Networks;
 
 internal static class DevelopmentInfrastructure
 {
@@ -13,9 +14,9 @@ internal static class DevelopmentInfrastructure
 
   private static JsonElement Broker => Service("elasticmq");
 
-  private static ushort BrokerPort => Broker.GetProperty("ports")[0].GetProperty("target").GetUInt16();
+  public static ushort BrokerPort => Broker.GetProperty("ports")[0].GetProperty("target").GetUInt16();
 
-  public static IContainer CreateBroker()
+  public static IContainer CreateBroker(INetwork? network = null)
   {
     var config = Broker.GetProperty("volumes").EnumerateArray().Single(mount =>
         mount.GetProperty("type").GetString() == "bind");
@@ -26,11 +27,12 @@ internal static class DevelopmentInfrastructure
       throw new InvalidDataException("The broker configuration must be inside the test output directory.");
     }
 
-    return new ContainerBuilder(RequiredString(Broker, "image"))
+    var builder = new ContainerBuilder(RequiredString(Broker, "image"))
         .WithPortBinding(BrokerPort, true)
         .WithResourceMapping(FilePath.Of(configPath), FilePath.Of(RequiredString(config, "target")))
-        .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(BrokerPort))
-        .Build();
+        .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(BrokerPort));
+
+    return (network is null ? builder : builder.WithNetwork(network).WithNetworkAliases("broker")).Build();
   }
 
   public static AmazonSQSClient CreateSqsClient(IContainer broker) => new("test", "test", new AmazonSQSConfig

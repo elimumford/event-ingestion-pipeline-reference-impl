@@ -1,0 +1,7 @@
+*
+!Directory.Packages.props
+!src/
+!src/Api/
+!src/Api/**
+**/bin
+**/obj

@@ -212,6 +212,16 @@ dotnet run --project src/Api
 
 The default HTTP launch profile listens on `http://localhost:5159` (or the configured launch URL), and workers automatically begin polling `inventory-events`.
 
+#### Build the API Container
+
+From the repository root, build the API image on the Docker host selected by the Docker CLI:
+
+```shell
+docker build -f src/Api/Dockerfile -t event-ingestion-api:local .
+```
+
+The multi-stage build restores and publishes with the .NET 10 SDK, then runs the published application as a non-root user on the ASP.NET runtime image. The container listens on port `8080`. Configure its PostgreSQL connection (`ConnectionStrings__DefaultConnection`) and SQS settings (`Sqs__Region` and `Sqs__QueueUrl`, plus `Sqs__ServiceUrl` for ElasticMQ) for reachable services; `localhost` inside a container refers to that container. Apply database migrations separately before processing events. Runtime credentials and network access must be supplied by the deployment environment.
+
 #### Health Probes & Tracing
 
 * **`GET /healthz` (readiness)**: Runs a read-only PostgreSQL `SELECT 1` and SQS `GetQueueAttributes` against the configured queue. Returns plain-text `Healthy` with HTTP 200 only when both checks succeed; otherwise returns `Unhealthy` with HTTP 503. Dependency failures are logged server-side, not exposed in the response.
@@ -245,6 +255,7 @@ dotnet test tests/IntegrationTests/IntegrationTests.csproj --filter "FullyQualif
 * **Channel configuration (`tests/IntegrationTests/Infrastructure/ChannelConfigurationTests.cs`)**: Verifies writes wait at the default 250-item bound and at an overridden capacity, resume when space becomes available, and reject nonpositive capacity during startup.
 * **Operational checks (`tests/IntegrationTests/Workers/EventProcessorConcurrencyTests.cs`)**: Uses test-owned PostgreSQL and ElasticMQ to verify readiness failures, liveness independence, bounded timeout/recovery with a paused broker, and exported HTTP/producer/consumer spans with W3C parentage through a persisted and acknowledged message.
 * **Broker topology (`tests/IntegrationTests/Infrastructure/ElasticMqTopologyTests.cs`)**: Copies the checked-in ElasticMQ configuration through the Docker API into an isolated container, verifies both queues' visibility settings and the DLQ policy, and confirms redrive after three unacknowledged receives.
+* **Containerized end-to-end (`tests/IntegrationTests/Endpoints/ContainerizedIngestionTests.cs`)**: Builds the API image from the checkout, starts it with isolated PostgreSQL and ElasticMQ containers, and verifies HTTP acceptance through persistence and acknowledgment.
 
 ---
 
